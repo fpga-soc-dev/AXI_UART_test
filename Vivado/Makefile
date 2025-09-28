@@ -1,0 +1,18 @@
+board_name := pynq_z1
+
+all: create_project bitstream check_timing
+	@echo
+	@tput setaf 2 ; echo "Built $(overlay_name) successfully!"; tput sgr0;
+	@echo
+
+create_project:
+	vivado -mode batch -source scripts/create_project.tcl -notrace
+	
+bitstream:
+	vivado -mode batch -source scripts/build_bitstream.tcl -notrace
+
+check_timing:
+	vivado -mode batch -source check_timing.tcl -notrace
+
+clean:
+	rm -rf $(board_name) *.jou *.log NA .Xil
