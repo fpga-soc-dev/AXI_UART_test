@@ -70,8 +70,13 @@ namespace Utils
         }
 
         ssize_t bytes_written = ::write(m_Fd, buffer, size);
+
         if (bytes_written == -1)
         {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                return -1;
+            }
             throw std::system_error(errno, std::generic_category(), "Write error");
         }
         return bytes_written;

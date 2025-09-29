@@ -34,13 +34,19 @@ namespace UART
         EVEN = 2
     };
 
+    enum class UartMode
+    {
+        BLOCKING,
+        NON_BLOCKING
+    };
+
     struct UartConfig
     {
-        BaudRate baud_rate = BaudRate::BAUD_115200;
-        DataBits data_bits = DataBits::DATA_8;
-        Parity parity = Parity::NONE;
-        std::chrono::milliseconds read_timeout{1000};
-        std::chrono::milliseconds write_timeout{1000};
+        BaudRate baud_rate{BaudRate::BAUD_230400};
+        DataBits data_bits{DataBits::DATA_8};
+        Parity parity{Parity::NONE};
+        std::chrono::milliseconds read_timeout{2000};
+        std::chrono::milliseconds write_timeout{2000};
     };
 
     struct InterruptEvent
@@ -54,8 +60,8 @@ namespace UART
     class UartDevice
     {
     public:
-        explicit UartDevice(const std::string &device_path);
-        explicit UartDevice(const std::string &device_path, const UartConfig &config);
+        explicit UartDevice(const std::string &device_path, UartMode mode = UartMode::BLOCKING);
+        explicit UartDevice(const std::string &device_path, const UartConfig &config, UartMode mode = UartMode::BLOCKING);
         ~UartDevice();
 
         UartDevice(const UartDevice &) = delete;
@@ -80,6 +86,7 @@ namespace UART
         std::unique_ptr<Utils::FileHandle> m_FileHandle;
         std::string m_DevicePath;
         UartConfig m_Config;
+        UartMode m_Mode;
 
         std::jthread m_InterruptThread;
         std::atomic<bool> m_InterruptEnabled{false};
@@ -88,5 +95,12 @@ namespace UART
 
         void ApplyConfig();
         void InterruptHandler(std::stop_token stop_token);
+        std::vector<uint8_t> ReadBlocking();
+        std::vector<uint8_t> ReadNonBlocking();
+        size_t WriteBlocking(std::span<const uint8_t> data);
+        size_t WriteNonBlocking(std::span<const uint8_t> data);
+
+        std::tuple<std::chrono::milliseconds, std::chrono::milliseconds, int> CalculateAdaptiveReadTimeouts() const;
+        std::chrono::milliseconds CalculateAdaptiveWriteTimeout() const;
     };
 } // namespace UART

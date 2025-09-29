@@ -7,6 +7,10 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/epoll.h>
+#include <poll.h>
+#include <cerrno>
+#include <cstring>
+#include <cmath>
 
 namespace UART
 {
@@ -33,10 +37,12 @@ namespace UART
 
     // O_NOCTTY: This flag tells the system not to make the opened file (in this case, the UART device) the controlling terminal for the process.
     // Without this flag, if your process opens a terminal device (like a UART), it could become the controlling terminal, which can lead to unexpected behavior (like receiving signals such as SIGINT from the terminal).
-    UartDevice::UartDevice(const std::string &device_path)
+    UartDevice::UartDevice(const std::string &device_path, UartMode mode)
         : m_DevicePath(device_path),
-          m_FileHandle(std::make_unique<Utils::FileHandle>(device_path, O_RDWR | O_NOCTTY))
+          m_Mode(mode),
+          m_FileHandle(std::make_unique<Utils::FileHandle>(device_path, O_RDWR | O_NOCTTY | (mode == UartMode::NON_BLOCKING ? O_NONBLOCK : 0)))
     {
+
         if (!m_FileHandle->IsOpen())
         {
             throw std::runtime_error("Failed to open UART device: " + device_path);
@@ -44,11 +50,11 @@ namespace UART
         ApplyConfig();
     }
 
-    UartDevice::UartDevice(const std::string &device_path, const UartConfig &config)
+    UartDevice::UartDevice(const std::string &device_path, const UartConfig &config, UartMode mode)
         : m_DevicePath(device_path),
           m_Config(config),
-          m_FileHandle(std::make_unique<Utils::FileHandle>(device_path, O_RDWR | O_NOCTTY))
-
+          m_Mode(mode),
+          m_FileHandle(std::make_unique<Utils::FileHandle>(device_path, O_RDWR | O_NOCTTY | (mode == UartMode::NON_BLOCKING ? O_NONBLOCK : 0)))
     {
         if (!m_FileHandle->IsOpen())
         {
@@ -115,12 +121,231 @@ namespace UART
         {
             throw std::runtime_error("UART device not open");
         }
-        ssize_t bytes_written = m_FileHandle->Write(data.data(), data.size());
-        if (bytes_written < 0)
+
+        if (m_Mode == UartMode::BLOCKING)
         {
-            throw std::runtime_error("Failed to write to UART device");
+            return WriteBlocking(data);
         }
-        return static_cast<size_t>(bytes_written);
+        else
+        {
+            return WriteNonBlocking(data);
+        }
+    }
+
+    size_t UartDevice::WriteBlocking(std::span<const uint8_t> data)
+    {
+        if (data.empty())
+        {
+            return 0;
+        }
+
+        size_t total_written = 0;
+        constexpr size_t MAX_CHUNK_SIZE = 512;
+        auto start_time = std::chrono::steady_clock::now();
+
+        // Replace the lambda with mathematical calculation
+        auto write_timeout = CalculateAdaptiveWriteTimeout();
+
+        struct pollfd pfd = {
+            .fd = m_FileHandle->GetFd(),
+            .events = POLLOUT,
+            .revents = 0};
+
+        while (total_written < data.size())
+        {
+            auto current_time = std::chrono::steady_clock::now();
+
+            if (current_time - start_time > write_timeout)
+            {
+                throw std::runtime_error("UART write timeout after " +
+                                         std::to_string(total_written) + " bytes written");
+            }
+
+            size_t remaining = data.size() - total_written;
+            size_t chunk_size = std::min(remaining, MAX_CHUNK_SIZE);
+
+            ssize_t bytes_written = m_FileHandle->Write(data.data() + total_written, chunk_size);
+
+            if (bytes_written > 0)
+            {
+                total_written += static_cast<size_t>(bytes_written);
+
+                if (total_written < data.size())
+                {
+                    // Mathematical delay calculation
+                    uint32_t baud = static_cast<uint32_t>(m_Config.baud_rate);
+                    constexpr uint32_t THRESHOLD_BAUD = 115200;
+
+                    // Linear interpolation between 50μs and 200μs based on baud rate
+                    double delay_factor = std::max(0.0, 1.0 - (static_cast<double>(baud) / THRESHOLD_BAUD));
+                    int delay_us = static_cast<int>(50 + delay_factor * 150); // 50-200μs range
+
+                    std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+                }
+
+                pfd.revents = 0;
+                continue;
+            }
+            else if (bytes_written == 0)
+            {
+                throw std::runtime_error("UART write returned 0 bytes");
+            }
+            else
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                else if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    auto remaining_timeout = write_timeout - (current_time - start_time);
+                    int poll_timeout_ms = static_cast<int>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(remaining_timeout).count());
+
+                    // Mathematical poll timeout calculation
+                    uint32_t baud = static_cast<uint32_t>(m_Config.baud_rate);
+                    constexpr uint32_t FAST_BAUD_THRESHOLD = 115200;
+
+                    // Linear scaling: 100ms for fast, 250ms for slow
+                    int max_poll_timeout = static_cast<int>(
+                        100 + (FAST_BAUD_THRESHOLD >= baud ? 150.0 * (FAST_BAUD_THRESHOLD - baud) / FAST_BAUD_THRESHOLD : 0));
+
+                    poll_timeout_ms = std::min(poll_timeout_ms, max_poll_timeout);
+
+                    if (poll_timeout_ms <= 0)
+                    {
+                        throw std::runtime_error("UART write timeout waiting for buffer space");
+                    }
+
+                    pfd.revents = 0;
+                    int poll_result = ::poll(&pfd, 1, poll_timeout_ms);
+
+                    if (poll_result < 0)
+                    {
+                        if (errno == EINTR)
+                        {
+                            continue;
+                        }
+                        throw std::runtime_error("Poll failed during write: " + std::string(strerror(errno)));
+                    }
+                    else if (poll_result == 0)
+                    {
+                        continue;
+                    }
+                    else if (pfd.revents & POLLOUT)
+                    {
+                        continue;
+                    }
+                    else if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+                    {
+                        throw std::runtime_error("UART write error detected by poll");
+                    }
+                }
+                else
+                {
+                    throw std::runtime_error("UART write failed: " + std::string(strerror(errno)));
+                }
+            }
+        }
+
+        return total_written;
+    }
+
+    size_t UartDevice::WriteNonBlocking(std::span<const uint8_t> data)
+    {
+        if (data.empty())
+        {
+            return 0;
+        }
+
+        size_t total_written = 0;
+        constexpr size_t MAX_CHUNK_SIZE = 512;
+        auto start_time = std::chrono::steady_clock::now();
+        auto write_timeout = CalculateAdaptiveWriteTimeout();
+
+        const int fd = m_FileHandle->GetFd();
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLOUT,
+            .revents = 0};
+
+        while (total_written < data.size())
+        {
+            auto current_time = std::chrono::steady_clock::now();
+
+            // Check timeout
+            if (current_time - start_time > write_timeout)
+            {
+                return total_written; // Return partial write instead of throwing
+            }
+
+            size_t remaining = data.size() - total_written;
+            size_t chunk_size = std::min(remaining, MAX_CHUNK_SIZE);
+
+            try
+            {
+                ssize_t bytes_written = m_FileHandle->Write(data.data() + total_written, chunk_size);
+
+                if (bytes_written > 0)
+                {
+                    total_written += static_cast<size_t>(bytes_written);
+
+                    // Brief adaptive delay for flow control
+                    uint32_t baud = static_cast<uint32_t>(m_Config.baud_rate);
+                    int delay_us = (baud >= 115200) ? 10 : 50; // Shorter delays for non-blocking
+                    std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+
+                    continue;
+                }
+                else if (bytes_written == 0)
+                {
+                    // This shouldn't happen, but handle gracefully
+                    break;
+                }
+            }
+            catch (const std::system_error &e)
+            {
+                if (e.code().value() == EAGAIN || e.code().value() == EWOULDBLOCK)
+                {
+                    // Write buffer full, use poll to wait for space
+                    auto remaining_timeout = write_timeout - (current_time - start_time);
+                    int poll_timeout_ms = static_cast<int>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(remaining_timeout).count());
+
+                    // Adaptive poll timeout
+                    uint32_t baud = static_cast<uint32_t>(m_Config.baud_rate);
+                    int max_poll_timeout = (baud >= 115200) ? 50 : 100; // Shorter for non-blocking
+                    poll_timeout_ms = std::min(poll_timeout_ms, max_poll_timeout);
+
+                    if (poll_timeout_ms <= 0)
+                    {
+                        break; // Timeout, return partial write
+                    }
+
+                    pfd.revents = 0;
+                    int poll_result = ::poll(&pfd, 1, poll_timeout_ms);
+
+                    if (poll_result <= 0)
+                    {
+                        continue; // Timeout or error, check main timeout on next iteration
+                    }
+                    else if (pfd.revents & POLLOUT)
+                    {
+                        continue; // Buffer has space, try writing again
+                    }
+                    else if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+                    {
+                        break; // Error condition
+                    }
+                }
+                else
+                {
+                    throw; // Re-throw other errors
+                }
+            }
+        }
+
+        return total_written;
     }
 
     std::vector<uint8_t> UartDevice::Read()
@@ -130,38 +355,191 @@ namespace UART
             throw std::runtime_error("UART device not open");
         }
 
-        size_t available_bytes = BytesAvailable();
-        if (available_bytes == 0)
+        if (m_Mode == UartMode::NON_BLOCKING)
         {
-            return {};
+            return ReadNonBlocking();
         }
-        std::vector<uint8_t> data;
-        data.reserve(available_bytes);
+        else
+        {
+            return ReadBlocking();
+        }
+    }
 
-        constexpr size_t CHUNK_SIZE = 256;
-        std::array<uint8_t, CHUNK_SIZE> temp_buffer;
+    std::vector<uint8_t> UartDevice::ReadBlocking()
+    {
+        std::vector<uint8_t> data;
+        constexpr size_t CHUNK_SIZE = 4096;
+        auto start_time = std::chrono::steady_clock::now();
+        auto last_data_time = start_time;
+
+        auto [idle_timeout, inter_chunk_timeout, total_timeout_multiplier] = CalculateAdaptiveReadTimeouts();
+
+        struct pollfd pfd = {
+            .fd = m_FileHandle->GetFd(),
+            .events = POLLIN,
+            .revents = 0};
 
         while (true)
         {
-            ssize_t bytes_read = m_FileHandle->Read(temp_buffer.data(), temp_buffer.size());
-
-            if (bytes_read < 0)
-            {
-                throw std::runtime_error("Failed to read from UART device");
-            }
-
-            if (bytes_read == 0)
+            auto current_time = std::chrono::steady_clock::now();
+            auto adaptive_total_timeout = m_Config.read_timeout * total_timeout_multiplier;
+            if (current_time - start_time > adaptive_total_timeout)
             {
                 break;
             }
 
-            data.insert(data.end(), temp_buffer.begin(), temp_buffer.begin() + bytes_read);
-
-            if (static_cast<size_t>(bytes_read) < CHUNK_SIZE)
+            if (current_time - last_data_time > idle_timeout && !data.empty())
             {
                 break;
+            }
+
+            auto remaining_total = std::chrono::duration_cast<std::chrono::milliseconds>(
+                adaptive_total_timeout - (current_time - start_time));
+            auto remaining_idle = std::chrono::duration_cast<std::chrono::milliseconds>(
+                idle_timeout - (current_time - last_data_time));
+
+            auto poll_timeout = std::min(remaining_total, remaining_idle);
+
+            int poll_timeout_ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(poll_timeout).count());
+
+            poll_timeout_ms = std::max(poll_timeout_ms, 10);
+
+            int poll_result = ::poll(&pfd, 1, poll_timeout_ms);
+
+            if (poll_result < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                throw std::runtime_error("Poll failed: " + std::string(strerror(errno)));
+            }
+
+            if (poll_result == 0)
+            {
+                if (data.empty())
+                {
+                    continue;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if (pfd.revents & POLLIN)
+            {
+                size_t bytes_available = BytesAvailable();
+                if (bytes_available > 0)
+                {
+                    size_t to_read = std::min(bytes_available, CHUNK_SIZE);
+                    std::vector<uint8_t> buffer(to_read);
+
+                    ssize_t bytes_read = m_FileHandle->Read(buffer.data(), buffer.size());
+
+                    if (bytes_read > 0)
+                    {
+                        buffer.resize(static_cast<size_t>(bytes_read));
+                        data.insert(data.end(), buffer.begin(), buffer.end());
+                        last_data_time = current_time;
+                    }
+                    else if (bytes_read < 0)
+                    {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                        {
+                            continue;
+                        }
+                        else if (errno == EINTR)
+                        {
+                            continue;
+                        }
+                        else
+                        {
+                            throw std::runtime_error("Read failed: " + std::string(strerror(errno)));
+                        }
+                    }
+                }
+            }
+
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            {
+                break;
+            }
+
+            pfd.revents = 0;
+        }
+
+        return data;
+    }
+
+    std::vector<uint8_t> UartDevice::ReadNonBlocking()
+    {
+        std::vector<uint8_t> data;
+        constexpr size_t CHUNK_SIZE = 4096;
+
+        // In non-blocking mode, we read all immediately available data and return
+        while (true)
+        {
+            // Check if data is available without blocking
+            size_t bytes_available = BytesAvailable();
+            if (bytes_available == 0)
+            {
+                break; // No data available, return what we have
+            }
+
+            // Read available data in chunks
+            size_t to_read = std::min(bytes_available, CHUNK_SIZE);
+            std::vector<uint8_t> buffer(to_read);
+
+            try
+            {
+                ssize_t bytes_read = m_FileHandle->Read(buffer.data(), buffer.size());
+
+                if (bytes_read > 0)
+                {
+                    buffer.resize(static_cast<size_t>(bytes_read));
+                    data.insert(data.end(), buffer.begin(), buffer.end());
+
+                    // If we read less than available, there might be more
+                    // Continue the loop to get the rest
+                    if (static_cast<size_t>(bytes_read) < bytes_available)
+                    {
+                        continue;
+                    }
+                }
+                else if (bytes_read == 0)
+                {
+                    break; // EOF
+                }
+                else if (bytes_read < 0)
+                {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    {
+                        // No data available right now (expected in non-blocking mode)
+                        break;
+                    }
+                    else if (errno == EINTR)
+                    {
+                        continue; // Interrupted by signal, try again
+                    }
+                    else
+                    {
+                        throw std::runtime_error("Non-blocking read failed: " + std::string(strerror(errno)));
+                    }
+                }
+            }
+            catch (const std::system_error &e)
+            {
+                // Handle FileHandle throwing system_error for EAGAIN
+                if (e.code().value() == EAGAIN || e.code().value() == EWOULDBLOCK)
+                {
+                    break; // No data available, return what we have
+                }
+                throw; // Re-throw other errors
             }
         }
+
         return data;
     }
 
@@ -320,9 +698,13 @@ namespace UART
         struct epoll_event events[1];
         std::vector<uint8_t> accumulated_data;
 
+        auto last_data_time = std::chrono::steady_clock::now();
+        auto [idle_timeout, inter_chunk_timeout, total_timeout_multiplier] = CalculateAdaptiveReadTimeouts();
+
         while (!token.stop_requested() && m_InterruptEnabled.load())
         {
-            int nfds = epoll_wait(epoll_fd, events, 1, 100); // 100 ms timeout
+            int epoll_timeout_ms = static_cast<int>(inter_chunk_timeout.count());
+            int nfds = epoll_wait(epoll_fd, events, 1, epoll_timeout_ms);
 
             if (nfds == -1)
             {
@@ -333,50 +715,84 @@ namespace UART
                 break;
             }
 
+            auto current_time = std::chrono::steady_clock::now();
+
             if (nfds > 0 && (events[0].events & EPOLLIN))
             {
                 try
                 {
-                    // Read all available data
-                    auto new_data = Read();
+                    // Use non-blocking read - gets all immediately available data
+                    auto new_data = ReadNonBlocking();
                     if (!new_data.empty())
                     {
                         accumulated_data.insert(accumulated_data.end(), new_data.begin(), new_data.end());
-                    }
-
-                    // Wait a short time to see if more data arrives (debouncing)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-                    // Check if more data is available
-                    if (BytesAvailable() == 0 && !accumulated_data.empty() && m_InterruptCallback)
-                    {
-                        // No more data available, send the accumulated data
-                        InterruptEvent interrupt_event{accumulated_data.size(), std::move(accumulated_data)};
-                        m_InterruptCallback(interrupt_event);
-                        accumulated_data.clear(); // Reset for next batch
+                        last_data_time = current_time;
                     }
                 }
                 catch (const std::exception &e)
                 {
-                    // Handle read errors gracefully
-                    InterruptEvent interrupt_event{0, {}};
+                    // Handle errors - send empty event to signal error
                     if (m_InterruptCallback)
                     {
+                        InterruptEvent interrupt_event{0, {}};
                         m_InterruptCallback(interrupt_event);
                     }
                     accumulated_data.clear();
+                    continue;
                 }
             }
 
-            // Handle timeout case - if we have accumulated data but no new data for a while
-            else if (!accumulated_data.empty() && m_InterruptCallback)
+            // Check if we should send accumulated data (adaptive idle timeout)
+            if (!accumulated_data.empty() &&
+                (current_time - last_data_time) > idle_timeout &&
+                m_InterruptCallback)
             {
                 InterruptEvent interrupt_event{accumulated_data.size(), std::move(accumulated_data)};
                 m_InterruptCallback(interrupt_event);
                 accumulated_data.clear();
+                last_data_time = current_time;
             }
         }
 
         close(epoll_fd);
+    }
+
+    std::tuple<std::chrono::milliseconds, std::chrono::milliseconds, int>
+    UartDevice::CalculateAdaptiveReadTimeouts() const
+    {
+        uint32_t baud = static_cast<uint32_t>(m_Config.baud_rate);
+        constexpr uint32_t REFERENCE_BAUD = 230400;
+
+        double baud_ratio = static_cast<double>(REFERENCE_BAUD) / baud;
+        double sqrt_scaling = std::sqrt(baud_ratio);
+
+        constexpr int BASE_IDLE_MS = 100;
+        constexpr int BASE_INTER_CHUNK_MS = 5;
+        constexpr int BASE_MULTIPLIER = 1;
+
+        auto idle_timeout = std::chrono::milliseconds(
+            static_cast<int>(std::clamp(BASE_IDLE_MS * sqrt_scaling, 50.0, 1000.0)));
+
+        auto inter_chunk_timeout = std::chrono::milliseconds(
+            static_cast<int>(std::clamp(BASE_INTER_CHUNK_MS * baud_ratio, 5.0, 100.0)));
+
+        int total_timeout_multiplier = static_cast<int>(
+            std::clamp(BASE_MULTIPLIER * std::min(sqrt_scaling, 10.0), 1.0, 10.0));
+
+        return {idle_timeout, inter_chunk_timeout, total_timeout_multiplier};
+    }
+
+    std::chrono::milliseconds UartDevice::CalculateAdaptiveWriteTimeout() const
+    {
+        uint32_t baud = static_cast<uint32_t>(m_Config.baud_rate);
+        constexpr uint32_t REFERENCE_BAUD = 230400;
+
+        double baud_ratio = static_cast<double>(REFERENCE_BAUD) / baud;
+        double sqrt_scaling = std::sqrt(baud_ratio);
+
+        auto scaled_timeout = std::chrono::milliseconds(
+            static_cast<int>(m_Config.write_timeout.count() * std::clamp(sqrt_scaling, 1.0, 10.0)));
+
+        return scaled_timeout;
     }
 } // namespace UART
