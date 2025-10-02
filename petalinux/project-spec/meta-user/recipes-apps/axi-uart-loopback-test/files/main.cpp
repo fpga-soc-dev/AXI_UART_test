@@ -7,8 +7,8 @@
 #include "UartDevice.hpp"
 
 constexpr size_t TEST_ITERATIONS = 5;
-constexpr size_t MIN_RANDOM_DATA_SIZE = 25 * 1024;
-constexpr size_t MAX_RANDOM_DATA_SIZE = 26 * 1024;
+constexpr size_t MIN_RANDOM_DATA_SIZE = 20 * 1024;
+constexpr size_t MAX_RANDOM_DATA_SIZE = 25 * 1024;
 constexpr auto UART0_DEVICE = "/dev/ttyUL1";
 constexpr auto UART1_DEVICE = "/dev/ttyUL2";
 
@@ -28,7 +28,12 @@ std::vector<uint8_t> GenerateRandomData(size_t min_size, size_t max_size)
     for (auto &byte : data)
     {
         byte = data_dis(gen);
+        if (byte == '\n')
+        {
+            byte = 180; // Replace newline with 180 (or any other value you prefer)
+        }
     }
+
     return data;
 }
 
@@ -62,10 +67,10 @@ int main()
         {
             fmt::print("=== Synchronous Test Iteration {} ===\n", i + 1);
             auto data = GenerateRandomData(MIN_RANDOM_DATA_SIZE, MAX_RANDOM_DATA_SIZE);
+            data.push_back('\n'); // delimiter
 
             uart0.Flush();
             uart1.Flush();
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             // PrintData(data, "Send   : UART0");
             uart0.Write(data);
@@ -84,7 +89,6 @@ int main()
 
             // PrintData(received_buffer1, "Receive: UART0");
             fmt::print("UART0 read {} bytes\n", received_buffer1.size());
-
             fmt::print("UART Test: {}\n", (data == received_buffer1) ? "PASS" : "FAIL");
         }
     }

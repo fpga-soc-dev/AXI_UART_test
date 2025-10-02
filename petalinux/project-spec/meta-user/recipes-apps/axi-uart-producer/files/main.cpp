@@ -8,8 +8,8 @@
 #include "UartDevice.hpp"
 
 constexpr size_t TEST_ITERATIONS = 5;
-constexpr size_t MIN_RANDOM_DATA_SIZE = 24 * 1024;
-constexpr size_t MAX_RANDOM_DATA_SIZE = 25 * 1024;
+constexpr size_t MIN_RANDOM_DATA_SIZE = 50 * 1024;
+constexpr size_t MAX_RANDOM_DATA_SIZE = 51 * 1024;
 constexpr auto RESPONSE_TIMEOUT = std::chrono::seconds(5);
 
 std::vector<uint8_t> GenerateRandomData(size_t min_size, size_t max_size)
@@ -28,6 +28,10 @@ std::vector<uint8_t> GenerateRandomData(size_t min_size, size_t max_size)
     for (auto &byte : data)
     {
         byte = data_dis(gen);
+        if (byte == '\n')
+        {
+            byte = 128;
+        }
     }
     return data;
 }
@@ -91,8 +95,6 @@ int main(int argc, char *argv[])
     {
         fmt::print("=== UART Producer Started ===\n");
         fmt::print("Device: {}\n", uart_device);
-        fmt::print("Iterations: {}\n", TEST_ITERATIONS);
-        fmt::print("Press Ctrl+C to exit\n\n");
 
         std::signal(SIGINT, SignalHandler);
         std::signal(SIGTERM, SignalHandler);
@@ -111,17 +113,12 @@ int main(int argc, char *argv[])
         {
             fmt::print("=== Iteration {}/{} ===\n", iteration, TEST_ITERATIONS);
 
-            // Generate random data to send
             auto data_to_send = GenerateRandomData(MIN_RANDOM_DATA_SIZE, MAX_RANDOM_DATA_SIZE);
-
             fmt::print("Sending {} bytes...\n", data_to_send.size());
-
-            // Send data
+            data_to_send.push_back('\n');
             uart.Write(data_to_send);
-
             fmt::print("Data sent successfully. Waiting for response...\n");
 
-            // Wait for response with timeout
             {
                 std::unique_lock<std::mutex> lock(g_data_mutex);
                 g_data_available = false;
@@ -138,32 +135,24 @@ int main(int argc, char *argv[])
                 if (received && g_data_available)
                 {
                     fmt::print("Response received: {} bytes\n", g_received_data.size());
-
-                    // Optional: Compare sent vs received data
                     if (g_received_data == data_to_send)
                     {
-                        fmt::print("✓ Data matches - Echo successful!\n");
+                        fmt::print("Echo successful!\n");
                     }
                     else
                     {
-                        fmt::print("✗ Data mismatch - Echo failed!\n");
-                        fmt::print("  Sent: {} bytes, Received: {} bytes\n",
+                        fmt::print("Echo failed!\n");
+                        fmt::print("Sent: {} bytes, Received: {} bytes\n",
                                    data_to_send.size(), g_received_data.size());
                     }
                 }
                 else
                 {
-                    fmt::print("✗ Timeout waiting for response\n");
+                    fmt::print("Timeout waiting for response\n");
                 }
             }
 
             fmt::print("\n");
-
-            // Small delay between iterations
-            if (iteration < TEST_ITERATIONS && g_running)
-            {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            }
         }
 
         uart.DisableInterrupts();
