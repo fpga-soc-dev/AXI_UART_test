@@ -5,6 +5,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <termios.h>
 #include "FileHandle.hpp"
 
 namespace UART
@@ -34,12 +35,6 @@ namespace UART
         EVEN = 2
     };
 
-    enum class UartMode
-    {
-        BLOCKING,
-        NON_BLOCKING
-    };
-
     struct UartConfig
     {
         BaudRate baud_rate{BaudRate::BAUD_230400};
@@ -60,8 +55,10 @@ namespace UART
     class UartDevice
     {
     public:
-        explicit UartDevice(const std::string &device_path, UartMode mode = UartMode::BLOCKING);
-        explicit UartDevice(const std::string &device_path, const UartConfig &config, UartMode mode = UartMode::BLOCKING);
+        static constexpr uint8_t MESSAGE_DELIMITER = '\n';
+
+        explicit UartDevice(const std::string &device_path);
+        explicit UartDevice(const std::string &device_path, const UartConfig &config);
         ~UartDevice();
 
         UartDevice(const UartDevice &) = delete;
@@ -74,7 +71,7 @@ namespace UART
         bool IsOpen() const;
 
         size_t Write(std::span<const uint8_t> data);
-        std::vector<uint8_t> Read();
+        std::vector<uint8_t> Read(int timeout_ms = 5000);
 
         void RegisterDataCallback(const InterruptCallback &callback);
         void DisableInterrupts();
@@ -86,8 +83,12 @@ namespace UART
         std::unique_ptr<Utils::FileHandle> m_FileHandle;
         std::string m_DevicePath;
         UartConfig m_Config;
-        UartMode m_Mode;
 
+        // No memory leaks if constructor throws
+        // No abandoned threads if exceptions occur
+        // Automatic cleanup in destructor
+        // Cooperative cancellation with stop_token
+        // Exception-safe move operations
         std::jthread m_InterruptThread;
         std::atomic<bool> m_InterruptEnabled{false};
         InterruptCallback m_InterruptCallback;
@@ -95,12 +96,8 @@ namespace UART
 
         void ApplyConfig();
         void InterruptHandler(std::stop_token stop_token);
-        std::vector<uint8_t> ReadBlocking();
-        std::vector<uint8_t> ReadNonBlocking();
-        size_t WriteBlocking(std::span<const uint8_t> data);
-        size_t WriteNonBlocking(std::span<const uint8_t> data);
 
-        std::tuple<std::chrono::milliseconds, std::chrono::milliseconds, int> CalculateAdaptiveReadTimeouts() const;
-        std::chrono::milliseconds CalculateAdaptiveWriteTimeout() const;
+        void PrintTermiosSettings(const termios &tty) const;
+        std::string SpeedToBaudRate(speed_t speed) const;
     };
 } // namespace UART
